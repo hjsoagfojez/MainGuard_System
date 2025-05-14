@@ -1,0 +1,598 @@
+import discord
+from discord.ext import commands
+from discord import ui
+import asyncio
+import json
+import datetime
+import time
+
+intents = discord.Intents.all()
+bot = commands.Bot(command_prefix="/", intents=intents)
+
+# Хранение данных
+try:
+    with open('config.json', 'r') as f:
+        config = json.load(f)
+except FileNotFoundError:
+    config = {
+        "ticket_channels": {},
+        "mod_roles": {},
+        "log_channels": {},
+        "warnings": {},
+        "muted_users": {},
+        "banned_users": {}
+    }
+
+def save_config():
+    with open('config.json', 'w') as f:
+        json.dump(config, f, indent=4)
+
+# Класс для модального окна тикета
+class TicketModal(ui.Modal, title="Создание тикета"):
+    issue = ui.TextInput(label="Опишите вашу проблему", style=discord.TextStyle.paragraph)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        guild_id = str(interaction.guild.id)
+        if guild_id not in config["ticket_channels"]:
+            await interaction.response.send_message("Канал для тикетов не настроен. Обратитесь к администратору.", ephemeral=True)
+            return
+        
+        channel_id = config["ticket_channels"][guild_id]
+        ticket_channel = interaction.guild.get_channel(int(channel_id))
+        
+        if not ticket_channel:
+            await interaction.response.send_message("Канал для тикетов не найден. Обратитесь к администратору.", ephemeral=True)
+            return
+        
+        embed = discord.Embed(
+            title=f"Тикет от {interaction.user.display_name}",
+            description=f"**Тип:** {self.title}\n**Проблема:** {self.issue.value}",
+            color=discord.Color.blue()
+        )
+        embed.set_footer(text=f"ID пользователя: {interaction.user.id}")
+        
+        view = discord.ui.View()
+        view.add_item(TicketButtons())
+        
+        await ticket_channel.send(embed=embed, view=view)
+        await interaction.response.send_message("Ваш тикет был успешно создан!", ephemeral=True)
+
+# Кнопки для тикетов
+class TicketButtons(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+    
+    @discord.ui.button(label="Взять тикет", style=discord.ButtonStyle.green, custom_id="check_ticket")
+    async def check_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild_id = str(interaction.guild.id)
+        if guild_id not in config["mod_roles"]:
+            await interaction.response.send_message("Роли модераторов не настроены.", ephemeral=True)
+            return
+        
+        mod_roles = [interaction.guild.get_role(int(role_id)) for role_id in config["mod_roles"][guild_id]]
+        if not any(role in interaction.user.roles for role in mod_roles if role):
+            await interaction.response.send_message("У вас нет прав для выполнения этого действия.", ephemeral=True)
+            return
+        
+        embed = interaction.message.embeds[0]
+        if "Принят модератором:" in embed.description:
+            await interaction.response.send_message("Этот тикет уже взят другим модератором.", ephemeral=True)
+            return
+        
+        embed.description += f"\n**Принят модератором:** {interaction.user.mention}"
+        await interaction.message.edit(embed=embed)
+        
+        self.children[0].disabled = True
+        await interaction.message.edit(view=self)
+        await interaction.response.send_message("Вы успешно взяли тикет на рассмотрение.", ephemeral=True)
+    
+    @discord.ui.button(label="Закрыть тикет", style=discord.ButtonStyle.red, custom_id="close_ticket")
+    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild_id = str(interaction.guild.id)
+        if guild_id not in config["mod_roles"]:
+            await interaction.response.send_message("Роли модераторов не настроены.", ephemeral=True)
+            return
+        
+        mod_roles = [interaction.guild.get_role(int(role_id)) for role_id in config["mod_roles"][guild_id]]
+        if not any(role in interaction.user.roles for role in mod_roles if role):
+            await interaction.response.send_message("У вас нет прав для выполнения этого действия.", ephemeral=True)
+            return
+        
+        embed = interaction.message.embeds[0]
+        await interaction.message.delete()
+        
+        user_id = int(embed.footer.text.split(": ")[1])
+        user = interaction.guild.get_member(user_id)
+        if user:
+            try:
+                await user.send(f"Ваш тикет был закрыт модератором {interaction.user.mention}.")
+            except:
+                pass
+        
+        await interaction.response.send_message("Тикет успешно закрыт.", ephemeral=True)
+
+# Выбор типа тикета
+class TicketSelect(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+    
+    @discord.ui.select(
+        placeholder="Выберите тип проблемы",
+        options=[
+            discord.SelectOption(label="Проблема с ботом", description="Сообщить о проблеме с ботом"),
+            discord.SelectOption(label="Проблема с сервером", description="Сообщить о проблеме с сервером"),
+            discord.SelectOption(label="Другое", description="Другая проблема")
+        ],
+        custom_id="ticket_type"
+    )
+    async def select_ticket_type(self, interaction: discord.Interaction, select: discord.ui.Select):
+        modal = TicketModal(title=select.values[0])
+        await interaction.response.send_modal(modal)
+
+# Команды тикетов
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def setup(ctx, role: discord.Role):
+    guild_id = str(ctx.guild.id)
+    if guild_id not in config["mod_roles"]:
+        config["mod_roles"][guild_id] = []
+    
+    if str(role.id) not in config["mod_roles"][guild_id]:
+        config["mod_roles"][guild_id].append(str(role.id))
+        save_config()
+        await ctx.send(f"Роль {role.mention} добавлена для управления тикетами.")
+    else:
+        await ctx.send("Эта роль уже добавлена.")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def changechannel(ctx, channel: discord.TextChannel):
+    guild_id = str(ctx.guild.id)
+    config["ticket_channels"][guild_id] = str(channel.id)
+    save_config()
+    await ctx.send(f"Канал для тикетов установлен на {channel.mention}")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def open(ctx):
+    view = TicketSelect()
+    await ctx.send("Нажмите на кнопку ниже, чтобы создать тикет:", view=view)
+
+# Команды модерации
+@bot.command()
+@commands.is_owner()
+async def sysban(ctx, user: discord.User, *, reason="Не указана"):
+    guild_id = str(ctx.guild.id)
+    if guild_id not in config["banned_users"]:
+        config["banned_users"][guild_id] = {}
+    
+    config["banned_users"][guild_id][str(user.id)] = {
+        "reason": reason,
+        "banned_by": ctx.author.id,
+        "timestamp": time.time()
+    }
+    save_config()
+    
+    for guild in bot.guilds:
+        if guild.owner_id == ctx.author.id:
+            try:
+                await guild.ban(user, reason=f"Системный бан: {reason}")
+            except:
+                pass
+    
+    await ctx.send(f"Пользователь {user} был забанен на всех серверах, где вы владелец. Причина: {reason}")
+
+@bot.command()
+@commands.is_owner()
+async def unsysban(ctx, user: discord.User):
+    guild_id = str(ctx.guild.id)
+    if guild_id in config["banned_users"] and str(user.id) in config["banned_users"][guild_id]:
+        del config["banned_users"][guild_id][str(user.id)]
+        save_config()
+    
+    for guild in bot.guilds:
+        if guild.owner_id == ctx.author.id:
+            try:
+                await guild.unban(user)
+            except:
+                pass
+    
+    await ctx.send(f"Пользователь {user} был разбанен на всех серверах, где вы владелец.")
+
+@bot.command()
+@commands.has_permissions(ban_members=True)
+async def ban(ctx, user: discord.Member, duration: str = None, *, reason="Не указана"):
+    if user.top_role >= ctx.author.top_role and ctx.author != ctx.guild.owner:
+        await ctx.send("Вы не можете забанить этого пользователя.")
+        return
+    
+    try:
+        await user.ban(reason=f"{reason} | Забанен: {ctx.author}")
+        guild_id = str(ctx.guild.id)
+        
+        if guild_id not in config["banned_users"]:
+            config["banned_users"][guild_id] = {}
+        
+        config["banned_users"][guild_id][str(user.id)] = {
+            "reason": reason,
+            "banned_by": ctx.author.id,
+            "timestamp": time.time(),
+            "duration": duration
+        }
+        save_config()
+        
+        embed = discord.Embed(
+            title="Пользователь забанен",
+            description=f"**Пользователь:** {user.mention}\n**Причина:** {reason}\n**Срок:** {duration if duration else 'Навсегда'}",
+            color=discord.Color.red()
+        )
+        await ctx.send(embed=embed)
+        
+        if guild_id in config["log_channels"]:
+            log_channel = ctx.guild.get_channel(int(config["log_channels"][guild_id]))
+            if log_channel:
+                await log_channel.send(embed=embed)
+    except Exception as e:
+        await ctx.send(f"Ошибка: {e}")
+
+@bot.command()
+@commands.has_permissions(ban_members=True)
+async def unban(ctx, user_id: int, *, reason="Не указана"):
+    try:
+        user = await bot.fetch_user(user_id)
+        await ctx.guild.unban(user, reason=f"{reason} | Разбанен: {ctx.author}")
+        
+        guild_id = str(ctx.guild.id)
+        if guild_id in config["banned_users"] and str(user_id) in config["banned_users"][guild_id]:
+            del config["banned_users"][guild_id][str(user_id)]
+            save_config()
+        
+        embed = discord.Embed(
+            title="Пользователь разбанен",
+            description=f"**Пользователь:** {user.mention}\n**Причина:** {reason}",
+            color=discord.Color.green()
+        )
+        await ctx.send(embed=embed)
+        
+        if guild_id in config["log_channels"]:
+            log_channel = ctx.guild.get_channel(int(config["log_channels"][guild_id]))
+            if log_channel:
+                await log_channel.send(embed=embed)
+    except Exception as e:
+        await ctx.send(f"Ошибка: {e}")
+
+@bot.command()
+@commands.has_permissions(kick_members=True)
+async def kick(ctx, user: discord.Member, *, reason="Не указана"):
+    if user.top_role >= ctx.author.top_role and ctx.author != ctx.guild.owner:
+        await ctx.send("Вы не можете кикнуть этого пользователя.")
+        return
+    
+    try:
+        await user.kick(reason=f"{reason} | Кикнут: {ctx.author}")
+        embed = discord.Embed(
+            title="Пользователь кикнут",
+            description=f"**Пользователь:** {user.mention}\n**Причина:** {reason}",
+            color=discord.Color.orange()
+        )
+        await ctx.send(embed=embed)
+        
+        guild_id = str(ctx.guild.id)
+        if guild_id in config["log_channels"]:
+            log_channel = ctx.guild.get_channel(int(config["log_channels"][guild_id]))
+            if log_channel:
+                await log_channel.send(embed=embed)
+    except Exception as e:
+        await ctx.send(f"Ошибка: {e}")
+
+@bot.command()
+@commands.has_permissions(kick_members=True)
+async def warn(ctx, user: discord.Member, duration: str = None, *, reason="Не указана"):
+    if user.top_role >= ctx.author.top_role and ctx.author != ctx.guild.owner:
+        await ctx.send("Вы не можете выдать предупреждение этому пользователю.")
+        return
+    
+    guild_id = str(ctx.guild.id)
+    if guild_id not in config["warnings"]:
+        config["warnings"][guild_id] = {}
+    
+    if str(user.id) not in config["warnings"][guild_id]:
+        config["warnings"][guild_id][str(user.id)] = []
+    
+    warning = {
+        "reason": reason,
+        "by": ctx.author.id,
+        "timestamp": time.time(),
+        "duration": duration
+    }
+    config["warnings"][guild_id][str(user.id)].append(warning)
+    save_config()
+    
+    warnings_count = len(config["warnings"][guild_id][str(user.id)])
+    
+    if warnings_count >= 3:
+        try:
+            await user.ban(reason="Автоматический бан за 3 предупреждения", delete_message_days=0)
+            del config["warnings"][guild_id][str(user.id)]
+            save_config()
+            
+            embed = discord.Embed(
+                title="Автоматический бан",
+                description=f"Пользователь {user.mention} получил 3 предупреждения и был автоматически забанен на 3 дня.",
+                color=discord.Color.red()
+            )
+            await ctx.send(embed=embed)
+            
+            if guild_id in config["log_channels"]:
+                log_channel = ctx.guild.get_channel(int(config["log_channels"][guild_id]))
+                if log_channel:
+                    await log_channel.send(embed=embed)
+            
+            # Автоматический разбан через 3 дня
+            await asyncio.sleep(3 * 24 * 60 * 60)
+            try:
+                await ctx.guild.unban(user, reason="Автоматический разбан после 3 дней")
+            except:
+                pass
+            
+            return
+        except Exception as e:
+            await ctx.send(f"Не удалось забанить пользователя: {e}")
+    
+    embed = discord.Embed(
+        title="Предупреждение выдано",
+        description=f"**Пользователь:** {user.mention}\n**Причина:** {reason}\n**Срок:** {duration if duration else 'Навсегда'}\n**Всего предупреждений:** {warnings_count}",
+        color=discord.Color.gold()
+    )
+    await ctx.send(embed=embed)
+    
+    if guild_id in config["log_channels"]:
+        log_channel = ctx.guild.get_channel(int(config["log_channels"][guild_id]))
+        if log_channel:
+            await log_channel.send(embed=embed)
+
+@bot.command()
+@commands.has_permissions(kick_members=True)
+async def unwarn(ctx, user: discord.Member, *, reason="Не указана"):
+    if user.top_role >= ctx.author.top_role and ctx.author != ctx.guild.owner:
+        await ctx.send("Вы не можете снять предупреждение с этого пользователя.")
+        return
+    
+    guild_id = str(ctx.guild.id)
+    if guild_id in config["warnings"] and str(user.id) in config["warnings"][guild_id] and config["warnings"][guild_id][str(user.id)]:
+        config["warnings"][guild_id][str(user.id)].pop()
+        save_config()
+        
+        warnings_count = len(config["warnings"][guild_id][str(user.id)])
+        
+        embed = discord.Embed(
+            title="Предупреждение снято",
+            description=f"**Пользователь:** {user.mention}\n**Причина:** {reason}\n**Оставшиеся предупреждения:** {warnings_count}",
+            color=discord.Color.green()
+        )
+        await ctx.send(embed=embed)
+        
+        if guild_id in config["log_channels"]:
+            log_channel = ctx.guild.get_channel(int(config["log_channels"][guild_id]))
+            if log_channel:
+                await log_channel.send(embed=embed)
+    else:
+        await ctx.send("У этого пользователя нет предупреждений.")
+
+@bot.command()
+@commands.has_permissions(manage_roles=True)
+async def mute(ctx, user: discord.Member, duration: str, *, reason="Не указана"):
+    if user.top_role >= ctx.author.top_role and ctx.author != ctx.guild.owner:
+        await ctx.send("Вы не можете замутить этого пользователя.")
+        return
+    
+    mute_role = discord.utils.get(ctx.guild.roles, name="Muted")
+    if not mute_role:
+        try:
+            mute_role = await ctx.guild.create_role(name="Muted")
+            
+            for channel in ctx.guild.channels:
+                try:
+                    await channel.set_permissions(mute_role, speak=False, send_messages=False)
+                except:
+                    pass
+        except Exception as e:
+            await ctx.send(f"Не удалось создать роль Muted: {e}")
+            return
+    
+    try:
+        await user.add_roles(mute_role, reason=f"{reason} | Мут выдан: {ctx.author}")
+        
+        guild_id = str(ctx.guild.id)
+        if guild_id not in config["muted_users"]:
+            config["muted_users"][guild_id] = {}
+        
+        config["muted_users"][guild_id][str(user.id)] = {
+            "reason": reason,
+            "by": ctx.author.id,
+            "timestamp": time.time(),
+            "duration": duration
+        }
+        save_config()
+        
+        embed = discord.Embed(
+            title="Пользователь замьючен",
+            description=f"**Пользователь:** {user.mention}\n**Причина:** {reason}\n**Срок:** {duration}",
+            color=discord.Color.dark_grey()
+        )
+        await ctx.send(embed=embed)
+        
+        if guild_id in config["log_channels"]:
+            log_channel = ctx.guild.get_channel(int(config["log_channels"][guild_id]))
+            if log_channel:
+                await log_channel.send(embed=embed)
+        
+        # Автоматический размут
+        try:
+            seconds = parse_duration(duration)
+            await asyncio.sleep(seconds)
+            await user.remove_roles(mute_role, reason="Автоматический размут")
+            
+            if guild_id in config["muted_users"] and str(user.id) in config["muted_users"][guild_id]:
+                del config["muted_users"][guild_id][str(user.id)]
+                save_config()
+        except:
+            pass
+    except Exception as e:
+        await ctx.send(f"Ошибка: {e}")
+
+def parse_duration(duration: str) -> int:
+    units = {
+        "s": 1,
+        "m": 60,
+        "h": 60*60,
+        "d": 60*60*24,
+        "w": 60*60*24*7
+    }
+    
+    total_seconds = 0
+    current_num = ""
+    
+    for char in duration.lower():
+        if char.isdigit():
+            current_num += char
+        elif char in units:
+            if current_num:
+                total_seconds += int(current_num) * units[char]
+                current_num = ""
+            else:
+                total_seconds += units[char]
+    
+    return total_seconds
+
+@bot.command()
+@commands.has_permissions(manage_roles=True)
+async def unmute(ctx, user: discord.Member, *, reason="Не указана"):
+    if user.top_role >= ctx.author.top_role and ctx.author != ctx.guild.owner:
+        await ctx.send("Вы не можете размутить этого пользователя.")
+        return
+    
+    mute_role = discord.utils.get(ctx.guild.roles, name="Muted")
+    if not mute_role:
+        await ctx.send("Роль Muted не найдена.")
+        return
+    
+    try:
+        await user.remove_roles(mute_role, reason=f"{reason} | Размучен: {ctx.author}")
+        
+        guild_id = str(ctx.guild.id)
+        if guild_id in config["muted_users"] and str(user.id) in config["muted_users"][guild_id]:
+            del config["muted_users"][guild_id][str(user.id)]
+            save_config()
+        
+        embed = discord.Embed(
+            title="Пользователь размьючен",
+            description=f"**Пользователь:** {user.mention}\n**Причина:** {reason}",
+            color=discord.Color.green()
+        )
+        await ctx.send(embed=embed)
+        
+        if guild_id in config["log_channels"]:
+            log_channel = ctx.guild.get_channel(int(config["log_channels"][guild_id]))
+            if log_channel:
+                await log_channel.send(embed=embed)
+    except Exception as e:
+        await ctx.send(f"Ошибка: {e}")
+
+@bot.command()
+@commands.has_permissions(manage_roles=True)
+async def giverole(ctx, user: discord.Member, *, role_name: str):
+    role = discord.utils.get(ctx.guild.roles, name=role_name)
+    if not role:
+        await ctx.send(f"Роль {role_name} не найдена.")
+        return
+    
+    if role >= ctx.author.top_role and ctx.author != ctx.guild.owner:
+        await ctx.send("Вы не можете выдавать эту роль.")
+        return
+    
+    try:
+        await user.add_roles(role, reason=f"Выдана модератором: {ctx.author}")
+        
+        embed = discord.Embed(
+            title="Роль выдана",
+            description=f"**Пользователь:** {user.mention}\n**Роль:** {role.name}",
+            color=discord.Color.blue()
+        )
+        await ctx.send(embed=embed)
+        
+        guild_id = str(ctx.guild.id)
+        if guild_id in config["log_channels"]:
+            log_channel = ctx.guild.get_channel(int(config["log_channels"][guild_id]))
+            if log_channel:
+                await log_channel.send(embed=embed)
+    except Exception as e:
+        await ctx.send(f"Ошибка: {e}")
+
+@bot.command()
+@commands.has_permissions(manage_roles=True)
+async def takerole(ctx, user: discord.Member, *, role_name: str):
+    role = discord.utils.get(ctx.guild.roles, name=role_name)
+    if not role:
+        await ctx.send(f"Роль {role_name} не найдена.")
+        return
+    
+    if role >= ctx.author.top_role and ctx.author != ctx.guild.owner:
+        await ctx.send("Вы не можете забирать эту роль.")
+        return
+    
+    try:
+        await user.remove_roles(role, reason=f"Забрана модератором: {ctx.author}")
+        
+        embed = discord.Embed(
+            title="Роль забрана",
+            description=f"**Пользователь:** {user.mention}\n**Роль:** {role.name}",
+            color=discord.Color.blue()
+        )
+        await ctx.send(embed=embed)
+        
+        guild_id = str(ctx.guild.id)
+        if guild_id in config["log_channels"]:
+            log_channel = ctx.guild.get_channel(int(config["log_channels"][guild_id]))
+            if log_channel:
+                await log_channel.send(embed=embed)
+    except Exception as e:
+        await ctx.send(f"Ошибка: {e}")
+
+# Логирование удаленных сообщений
+@bot.event
+async def on_message_delete(message):
+    if message.author.bot:
+        return
+    
+    guild_id = str(message.guild.id)
+    if guild_id not in config["log_channels"]:
+        return
+    
+    log_channel = message.guild.get_channel(int(config["log_channels"][guild_id]))
+    if not log_channel:
+        return
+    
+    embed = discord.Embed(
+        title="Сообщение удалено",
+        description=f"**Автор:** {message.author.mention}\n**Канал:** {message.channel.mention}\n**Содержимое:** {message.content}",
+        color=discord.Color.red(),
+        timestamp=datetime.datetime.now()
+    )
+    await log_channel.send(embed=embed)
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def setlogchannel(ctx, channel: discord.TextChannel):
+    guild_id = str(ctx.guild.id)
+    config["log_channels"][guild_id] = str(channel.id)
+    save_config()
+    await ctx.send(f"Канал для логов установлен на {channel.mention}")
+
+@bot.event
+async def on_ready():
+    print(f"Бот {bot.user} готов к работе!")
+    bot.add_view(TicketSelect())
+    bot.add_view(TicketButtons())
+
+bot.run('YOUR_BOT_TOKEN')
